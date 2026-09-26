@@ -1,6 +1,6 @@
 local binary = {}
 
-function binary.encode_32bit(n)
+function binary.encode_u32(n)
   return string.char (
     bit32.extract(n, 0, 8),
     bit32.extract(n, 8, 8),
@@ -19,7 +19,7 @@ function binary.decode_u32(t)
 end
 
 function binary.decode_i32(t)
-  n = binary.decode_u32(t)
+  local n = binary.decode_u32(t)
   
   if n > 2147483647 then
     return n - 4294967296
