@@ -2,6 +2,64 @@ local require = require "cmod" (...)
 local binary = require "lib.binary"
 local Buffer = require "lib.buffer"
 
+---@alias kdb.CompareFn fun(offset: integer, node: kdb.Node): -1 | 0 | 1
+
+---@param xo integer|nil
+---@param xw integer
+---@return kdb.CompareFn
+local function isLessFreeNode(xo, xw)
+  return function(_, node)
+    if xw < node.key_size then
+      return -1
+    elseif xw > node.key_size then
+      return 1
+    end
+
+    if xo == nil then
+      return 0
+    elseif xo < node.value_offset then
+      return -1
+    elseif xo > node.value_offset then
+      return 1
+    else
+      return 0
+    end
+  end
+end
+
+---@param key string
+---@return kdb.CompareFn
+local function isLessDataNode(buf, key)
+  return function(offset, node)
+    local mn = math.min(#key, node.key_size)
+
+    local y = Buffer.read_at(buf, offset + 16, mn)
+    if y == nil then
+      error(
+        ("[kdb::isLessDataNode] failed to load node key (offset: %s, size: %s)")
+        :format(offset + 16, mn)
+      )
+    end
+
+    for i = 1, mn do
+      local a, b = key:sub(i, i), y:sub(i, i)
+      if a < b then
+        return -1
+      elseif a > b then
+        return 1
+      end
+    end
+
+    if #key < node.key_size then
+      return -1
+    elseif #key > node.key_size then
+      return 1
+    else
+      return 0
+    end
+  end
+end
+
 ---@class kdb.KDB
 local KDB = {}
 KDB.__index = KDB
@@ -14,6 +72,18 @@ function KDB:new(file)
 
   self.fd = file
   self.is_ready = false
+
+  self._lessFreeDataNodeFactory = function(offset)
+    self:_seek_at(offset)
+    local node = self:_read_node()
+    if node == nil then
+      error(
+        ("[KDB._lessFreeDataNodeFactory] failed to load target node (offset: %s)"):format(offset)
+      )
+    end
+
+    return isLessFreeNode(node.value_offset, node.key_size)
+  end
 
   return self
 end
@@ -55,7 +125,7 @@ function KDB:_initialize_db()
     left_offset = 0,
     right_offset = 0,
     value_offset = self.free_pages_root + 16,
-    key_size = 1024 - self.free_pages_root
+    key_size = 1024 - self.free_pages_root - 16
   }
 end
 
@@ -163,70 +233,20 @@ function KDB:_write_node(data)
   return data
 end
 
----@alias kdb.CompareFn fun(offset: integer, node: kdb.Node): -1 | 0 | 1
-
----@return kdb.CompareFn
-local function isLessFreeNode(xo, xw)
-  return function(_, node)
-    if xw < node.key_size then
-      return -1
-    elseif xw > node.key_size then
-      return 1
-    end
-
-    if xo < node.value_offset then
-      return -1
-    elseif xo > node.value_offset then
-      return 1
-    else
-      return 0
-    end
-  end
-end
-
----@param key string
----@return kdb.CompareFn
-local function isLessDataNode(buf, key)
-  return function(offset, node)
-    local mn = math.min(#key, node.key_size)
-
-    local y = Buffer.read_at(buf, offset + 16, mn)
-    if y == nil then
-      error(
-        ("[kdb::isLessDataNode] failed to load node key (offset: %s, size: %s)")
-        :format(offset + 16, mn)
-      )
-    end
-
-    for i = 1, mn do
-      local a, b = key:sub(i,i), y:sub(i,i)
-      if a < b then
-        return -1
-      elseif a > b then
-        return 1
-      end
-    end
-
-    if #key < node.key_size then
-      return -1
-    elseif #key > node.key_size then
-      return 1
-    else
-      return 0
-    end
-  end
-end
-
----@alias kdb.NextFn<R> fun(target_offset: integer, target_node: kdb.Node, dir: -1 | 0 | 1, parent_offset: integer|nil, parent_dir: -1 | 0 | 1): R
----@generic R
+---@alias kdb.FindResult {
+---  target_offset: integer;
+---  target_node: kdb.Node;
+---  dir: -1 | 0 | 1;
+---  parent_offset: integer | nil;
+---  parent_dir: -1 | 0 | 1;
+---}
 ---@param target integer
 ---@param cmp kdb.CompareFn
----@param next kdb.NextFn<R>
 ---@param curr integer|nil
 ---@param parent integer|nil
 ---@param parent_dir -1|0|1|nil
----@return R
-function KDB:_find_node(target, cmp, next, curr, parent, parent_dir)
+---@return kdb.FindResult
+function KDB:_find_node(target, cmp, curr, parent, parent_dir)
   if curr == nil then
     curr = self.fd:seek("cur", 0)
   end
@@ -240,33 +260,102 @@ function KDB:_find_node(target, cmp, next, curr, parent, parent_dir)
   if node == nil then
     error(
       ("[kdb._find_node] failed to read target node (node: %s)")
-      :format(self.free_pages_root)
+      :format(target)
     )
   end
 
   local dir = cmp(target, node)
-
   if dir < 0 then
     if node.left_offset > 0 then
-      return self:_find_node(node.left_offset, cmp, next, curr, target, dir)
+      return self:_find_node(node.left_offset, cmp, curr, target, dir)
     end
-
-    self.fd:seek("set", curr)
-
-    return next(target, node, dir, parent, parent_dir or 0)
   elseif dir == 0 then
-    self.fd:seek("set", curr)
-
-    return next(target, node, dir, parent, parent_dir or 0)
+    --
   else
     if node.right_offset > 0 then
-      return self:_find_node(node.right_offset, cmp, next, curr, target, dir)
+      return self:_find_node(node.right_offset, cmp, curr, target, dir)
+    end
+  end
+
+  self.fd:seek("set", curr)
+
+  return {
+    target_offset = target,
+    target_node = node,
+    dir = dir,
+    parent_offset = parent,
+    parent_dir = parent_dir or 0
+  }
+end
+
+---@param target integer
+---@param size integer
+---@param curr integer|nil
+---@param parent integer|nil
+---@param ...integer|nil
+function KDB:_find_allocatable_node(target, size, curr, parent)
+  if curr == nil then
+    curr = self.fd:seek("cur", 0)
+  end
+
+  local node = nil
+  if target > 0 then
+    self:_seek_at(target)
+    node = self:_read_node()
+  end
+
+  if node == nil then
+    error(
+      ("[kdb._find_allocatable_node] failed to read target node (node: %s)")
+      :format(target)
+    )
+  end
+
+  if node.left_offset > 0 then
+    local left = nil
+    self:_seek_at(node.left_offset)
+    left = self:_read_node()
+
+    if left == nil then
+      error(
+        ("[kdb._find_allocatable_node] failed to read target left node (left: %s)")
+        :format(node.left_offset)
+      )
     end
 
+    if size < left.key_size then
+      return self:_find_allocatable_node(node.left_offset, size, curr, target)
+    end
+  end
+
+  if size < node.key_size then
     self.fd:seek("set", curr)
 
-    return next(target, node, dir, parent, parent_dir or 0)
+    return {
+      target_offset = target,
+      target_node = node,
+      parent_offset = parent
+    }
   end
+
+  if node.right_offset > 0 then
+    local right = nil
+    self:_seek_at(node.right_offset)
+    right = self:_read_node()
+
+    if right == nil then
+      error(
+        ("[kdb._find_allocatable_node] failed to read target right node (right: %s)")
+        :format(node.right_offset)
+      )
+    end
+
+    if size < right.key_size then
+      return self:_find_allocatable_node(node.right_offset, size, curr, target)
+    end
+  end
+
+  return nil
 end
 
 function KDB:_allocate_page(n)
@@ -280,84 +369,244 @@ function KDB:_allocate_page(n)
   local start = self.sections + 1
   local tail = self.sections + n
   self.sections = tail
+  self:_write_header(self)
 
   self.fd:seek("set", curr)
 
   return start, tail
 end
 
-function KDB:_allocate_space(size, target, curr)
+---@param target_offset integer
+---@param parent_offset integer
+---@param root_offset integer
+---@param getComparator fun(offset: integer): kdb.CompareFn
+---@return nil
+function KDB:_insert_node(target_offset, parent_offset, root_offset, getComparator)
+  local findResult = self:_find_node(parent_offset, getComparator(target_offset))
+  if findResult.dir == 0 then
+    error(
+      ("[kdb:_insert_node] node insertion conflicted (node_offset: %s, tree_offset: %s)")
+      :format(target_offset, parent_offset)
+    )
+  elseif findResult.dir < 0 then
+    local tl = findResult.target_node.left_offset
+    findResult.target_node.left_offset = target_offset
+
+    self:_seek_at(findResult.target_offset)
+    self:_write_node(findResult.target_node)
+
+    if tl > 0 then
+      return self:_insert_node(tl, root_offset, root_offset, getComparator)
+    end
+  else
+    local tr = findResult.target_node.right_offset
+    findResult.target_node.right_offset = target_offset
+
+    self:_seek_at(findResult.target_offset)
+    self:_write_node(findResult.target_node)
+
+    if tr > 0 then
+      return self:_insert_node(tr, root_offset, root_offset, getComparator)
+    end
+  end
+end
+
+---@param target_offset integer
+function KDB:_free_data_node(target_offset)
+  self:_seek_at(target_offset)
+  local node = self:_read_node()
+  if node == nil then
+    error(("[KDB:_free_data_node] failed to read target node (offset: %s)"):format(target_offset))
+  end
+
+  node.value_offset = target_offset
+  node.key_size = node.key_size + 16
+  node.left_offset = 0
+  node.right_offset = 0
+
+  self:_seek_at(target_offset)
+  self:_write_node(node)
+
+  self:_insert_node(target_offset, self.free_pages_root, self.free_pages_root, self._lessFreeDataNodeFactory)
+end
+
+function KDB:_remove_space_node(target_offset, parent_offset, target_node, parent_node)
+  if target_node == nil then
+    self:_seek_at(target_offset)
+    target_node = self:_read_node()
+  end
+
+  if target_node == nil then
+    error(("[KDB:_free_data_node] failed to read target node (offset: %s)"):format(target_offset))
+  end
+
+  if parent_offset == nil then
+    if self.free_pages_root ~= nil and target_offset ~= self.free_pages_root then
+      error(("[KDB:_free_data_node] target node is not root node (offset: %s)"):format(target_offset))
+    end
+
+    local left_offset, right_offset = target_node.left_offset, target_node.right_offset
+    target_node.left_offset = 0
+    target_node.right_offset = 0
+
+    self:_seek_at(target_offset)
+    self:_write_node(target_node)
+
+    if left_offset > 0 then
+      if self.free_pages_root == nil then
+        self.free_pages_root = left_offset
+      else
+        self:_insert_node(left_offset, self.free_pages_root, self.free_pages_root, self._lessFreeDataNodeFactory)
+      end
+    end
+
+    if right_offset > 0 then
+      if self.free_pages_root == nil then
+        self.free_pages_root = right_offset
+      else
+        self:_insert_node(right_offset, self.free_pages_root, self.free_pages_root, self
+          ._lessFreeDataNodeFactory)
+      end
+    end
+  else
+    if parent_node == nil then
+      self:_seek_at(parent_offset)
+      parent_node = self:_read_node()
+    end
+
+    if parent_node == nil then
+      error(("[KDB:_free_data_node] failed to read parent node (offset: %s)"):format(parent_offset))
+    end
+
+    if parent_node.left_offset == target_offset then
+      parent_node.left_offset = 0
+    elseif parent_node.right_offset == target_offset then
+      parent_node.right_offset = 0
+    else
+      error(("[KDB:_free_data_node] target node is not children (target_offset: %s, parent_offset: %s)"):format(
+        target_offset, parent_offset))
+    end
+
+    self:_seek_at(parent_offset)
+    self:_write_node(parent_node)
+
+    local left_offset, right_offset = target_node.left_offset, target_node.right_offset
+    target_node.left_offset = 0
+    target_node.right_offset = 0
+
+    self:_seek_at(target_offset)
+    self:_write_node(target_node)
+
+    if left_offset > 0 then
+      self:_insert_node(left_offset, self.free_pages_root, self.free_pages_root, self._lessFreeDataNodeFactory)
+    end
+
+    if right_offset > 0 then
+      self:_insert_node(right_offset, self.free_pages_root, self.free_pages_root, self
+        ._lessFreeDataNodeFactory)
+    end
+  end
+
+  return target_offset
+end
+
+function KDB:_allocate_space(size, target, curr, loop_count)
+  loop_count = (loop_count or 0) + 1
+  if loop_count > 32 then
+    error(("[KDB:_allocate_space] allocation loop detected (loop_count: %s)"):format(loop_count))
+  end
+  
   target = target or self.free_pages_root
   curr = curr or self.fd:seek("cur", 0)
 
-  local node = nil
-  if target > 0 then
-    self:_seek_at(target)
-    node = self:_read_node()
-  end
+  local findResult = self:_find_allocatable_node(
+    target,
+    size
+  )
 
-  if node == nil then
-    local start, tail = self:_allocate_page(math.floor((size + 1023) / 1024))
-    local o, s = start * 256 * 4, (tail - start) * 256 * 4
+  if findResult ~= nil then
+    local rem = findResult.target_node.key_size - size
+    if rem > 0 then
+      self:_remove_space_node(findResult.target_offset, findResult.parent_offset, findResult.target_node)
 
-    self:_seek_at(o)
-    node = self:_write_node {
-      left_offset = 0,
-      right_offset = 0,
-      value_offset = o + 16,
-      key_size = size
-    }
-
-    target = self:_find_node(
-      self.free_pages_root,
-      isLessFreeNode(o + 16, s),
-      function(target_offset, target_node, dir)
-        if dir == 0 then
-          error(
-            ("[kdb.allocate_space] duplicated free space (offset: %s, size: %s)")
-            :format(o + 16, s)
-          )
-        elseif dir < 0 then
-          self:_seek_at(target_offset)
-          self:_write_node {
-            left_offset = o,
-            right_offset = target_node.right_offset,
-            value_offset = target_node.value_offset,
-            key_size = target_node.key_size
-          }
-        else
-          self:_seek_at(target_offset)
-          self:_write_node {
-            left_offset = target_node.left_offset,
-            right_offset = o,
-            value_offset = target_node.value_offset,
-            key_size = target_node.key_size
-          }
+      local value_offset = findResult.target_node.value_offset
+      if value_offset == findResult.target_offset then
+        if rem <= 0 then
+          error("ERROR")
         end
 
-        return target_offset
+        self:_seek_at(findResult.target_offset)
+        self:_write_node {
+          left_offset = 0,
+          right_offset = 0,
+          value_offset = value_offset,
+          key_size = rem
+        }
+
+        value_offset = value_offset + 16 + rem
+      else
+        self:_seek_at(findResult.target_offset)
+        self:_write_node {
+          left_offset = 0,
+          right_offset = 0,
+          value_offset = value_offset,
+          key_size = rem
+        }
+
+        value_offset = value_offset + rem
       end
-    )
-  end
 
-  if size <= node.key_size then
-    local rem = node.key_size - size
-    if rem > 0 then
-      self:_seek_at(target)
+      if findResult.target_offset ~= self.free_pages_root then
+        self:_insert_node(findResult.target_offset, self.free_pages_root, self.free_pages_root,
+          self._lessFreeDataNodeFactory)
+      end
+
+      self.fd:seek("set", curr)
+
+      return value_offset
+    elseif rem == 0 then
+      local value_offset = findResult.target_node.value_offset
+      self:_remove_space_node(findResult.target_offset, findResult.parent_offset, findResult.target_node)
+
+      self:_seek_at(findResult.target_offset)
       self:_write_node {
-        left_offset = node.left_offset,
-        right_offset = node.right_offset,
-        value_offset = node.value_offset + size,
-        key_size = rem
+        left_offset = 0,
+        right_offset = 0,
+        value_offset = findResult.target_offset,
+        key_size = 16
       }
+
+      if findResult.target_offset ~= self.free_pages_root then
+        self:_insert_node(findResult.target_offset, self.free_pages_root, self.free_pages_root,
+          self._lessFreeDataNodeFactory)
+      end
+
+      self.fd:seek("set", curr)
+
+      return value_offset
     end
-
-    self.fd:seek("set", curr)
-
-    return node.value_offset, size
-  else
-    return self:_allocate_space(size, node.right_offset, curr)
   end
+
+  -- tarinai no naraba aratashii page wo kakuho
+
+  local start, tail = self:_allocate_page(math.floor((size + 1023 + 16) / 1024))
+  local o, s = start * 256 * 4, (tail - start + 1) * 256 * 4
+
+  self:_seek_at(o)
+  self:_write_node {
+    left_offset = 0,
+    right_offset = 0,
+    value_offset = o + 16,
+    key_size = s - 16
+  }
+
+  if o ~= self.free_pages_root then
+    self:_insert_node(o, self.free_pages_root, self.free_pages_root, self._lessFreeDataNodeFactory)
+  end
+
+  -- mokkai yaru
+
+  return self:_allocate_space(size, nil, curr, loop_count)
 end
 
 function KDB:_create_data_node(key, value_offset)
@@ -400,59 +649,95 @@ end
 function KDB:put(key, value)
   if self.datas_root == 0 then
     self.datas_root = self:_create_data_node(key, self:_create_data_value(value))
-    self:_write_header (self)
+    self:_write_header(self)
 
     return self.datas_root
   end
 
-  return self:_find_node(
+  local findResult = self:_find_node(
     self.datas_root,
-    isLessDataNode(self.fd, key),
-    function(target_offset, target_node, dir, parent_offset, parent_dir)
-      if dir == 0 then
-        self:_seek_at(target_node.value_offset)
-        local value_size = self:_read_data_header()
-        if #value == value_size then
-          self.fd:write(value)
-
-          return target_offset
-        else
-          local value_offset = self:_create_data_value(value)
-
-          self:_seek_at(target_offset)
-          self:_write_node {
-            left_offset = target_node.left_offset,
-            right_offset = target_node.right_offset,
-            key_size = target_node.key_size,
-            value_offset = value_offset
-          }
-        end
-
-        return target_offset
-      end
-
-      local node_offset = self:_create_data_node(key, self:_create_data_value(value))
-      if dir < 0 then
-        self:_seek_at(target_offset)
-        self:_write_node {
-          left_offset = node_offset,
-          right_offset = target_node.right_offset,
-          key_size = target_node.key_size,
-          value_offset = target_node.value_offset
-        }
-      else
-        self:_seek_at(target_offset)
-        self:_write_node {
-          left_offset = target_node.left_offset,
-          right_offset = node_offset,
-          key_size = target_node.key_size,
-          value_offset = target_node.value_offset
-        }
-      end
-
-      return node_offset
-    end
+    isLessDataNode(self.fd, key)
   )
+
+  if findResult.dir == 0 then
+    self:_seek_at(findResult.target_node.value_offset)
+    local value_size = self:_read_data_header()
+    if #value == value_size then
+      self.fd:write(value)
+
+      return findResult.target_offset
+    else
+      local value_offset = self:_create_data_value(value)
+
+      self:_seek_at(findResult.target_offset)
+      self:_write_node {
+        left_offset = findResult.target_node.left_offset,
+        right_offset = findResult.target_node.right_offset,
+        key_size = findResult.target_node.key_size,
+        value_offset = value_offset
+      }
+    end
+
+    return findResult.target_offset
+  end
+
+  local node_offset = self:_create_data_node(key, self:_create_data_value(value))
+  if findResult.dir < 0 then
+    self:_seek_at(findResult.target_offset)
+    self:_write_node {
+      left_offset = node_offset,
+      right_offset = findResult.target_node.right_offset,
+      key_size = findResult.target_node.key_size,
+      value_offset = findResult.target_node.value_offset
+    }
+  else
+    self:_seek_at(findResult.target_offset)
+    self:_write_node {
+      left_offset = findResult.target_node.left_offset,
+      right_offset = node_offset,
+      key_size = findResult.target_node.key_size,
+      value_offset = findResult.target_node.value_offset
+    }
+  end
+
+  return node_offset
+end
+
+function KDB:get(...)
+  if self.datas_root == 0 then
+    return
+  end
+
+  local results = {}
+  local n = select("#", ...)
+
+  for i = 1, n do
+    local findResult = self:_find_node(
+      self.datas_root,
+      isLessDataNode(self.fd, (select(i, ...)))
+    )
+
+    if findResult.dir == 0 then
+      results[i] = findResult.target_node.value_offset
+    end
+  end
+
+  for i = 1, n do
+    local offset = results[i]
+    if offset ~= nil then
+      self:_seek_at(offset)
+      local size = self:_read_data_header()
+      if size == nil then
+        error(("[KDB:get] failed to load value section (value_offset: %s, size: %s)"):format(offset, size))
+      end
+
+      results[i] = self.fd:read(size)
+    else
+      results[i] = nil
+    end
+  end
+
+  return n, table.unpack(results, 1, n)
 end
 
 function KDB:close()
