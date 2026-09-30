@@ -16,8 +16,6 @@ end
 ---@return number
 function Buffer:seek(whence, n) return 0 end
 
-function Buffer:size() return 0 end
-
 ---@param b string
 function Buffer:write(b) end
 
@@ -27,10 +25,18 @@ function Buffer:read(w) end
 
 function Buffer:close() end
 
+function Buffer:size()
+  local curr = self:seek('cur', 0)
+  local n = self:seek("end", 0)
+  self:seek("set", curr)
+
+  return n
+end
+
 ---@param n integer
 ---@param w integer
 function Buffer:write_u32(n, w)
-  return self:write(binary.encode_u32(n):sub(1,w))
+  return self:write(binary.encode_u32(n):sub(1, w))
 end
 
 ---@param w integer
@@ -42,6 +48,18 @@ function Buffer:read_u32(w)
   end
 
   return binary.decode_u32(b)
+end
+
+---@param b kdb.lib.buffer.Buffer
+---@param o integer
+---@param w integer
+function Buffer.read_at(b, o, w)
+  local curr = b:seek("cur", 0)
+  b:seek("set", o)
+  local chunk = b:read(w)
+  b:seek("set", curr)
+
+  return chunk
 end
 
 return Buffer
